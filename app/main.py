@@ -4,6 +4,9 @@ from datetime import datetime, timedelta, timezone, date, time
 from decimal import Decimal, ROUND_HALF_UP
 from typing import Optional
 
+from bson.json_util import dumps
+import json
+
 import certifi
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Query, Request
@@ -520,12 +523,16 @@ def department_trend(department: str, from_date: str = Query(..., alias="from"),
     return {"department": department, "items": output}
 
 
+
+
 @app.get("/admin/explain/{endpoint}")
 def explain_endpoint(
     request: Request,
     endpoint: str,
     emp_code: Optional[str] = None,
-    month: Optional[str] = Query(None, pattern=r"^\d{4}-(0[1-9]|1[0-2])$"),
+    month: Optional[str] = Query(
+        None, pattern=r"^\d{4}-(0[1-9]|1[0-2])$"
+    ),
     department: Optional[str] = None,
     limit: int = Query(10, ge=1, le=50),
     date_from: Optional[str] = None,
@@ -536,95 +543,179 @@ def explain_endpoint(
     page: int = Query(1, ge=1),
     page_size: int = Query(20, ge=1, le=100),
 ):
-    allowed = {"attendance_list", "employee_monthly", "department_summary", "late_leaderboard", "department_trend"}
+    from_value = request.query_params.get("from") or from_date
+    to_value = request.query_params.get("to") or to_date
+
+    allowed = {
+        "attendance_list",
+        "employee_monthly",
+        "department_summary",
+        "late_leaderboard",
+        "department_trend",
+    }
+
     if endpoint not in allowed:
-        raise HTTPException(422, f"endpoint must be one of {sorted(allowed)}")
+        raise HTTPException(
+            status_code=422,
+            detail=f"endpoint must be one of {sorted(allowed)}",
+        )
+
+    collection = "attendance_logs"
+
+    # 1. Attendance list
     if endpoint == "attendance_list":
         q = {}
+
         if emp_code:
             q["emp_code"] = emp_code
+
         if date_from or date_to:
             q["date"] = {}
+
             if date_from:
                 parse_day(date_from)
                 q["date"]["$gte"] = date_from
+
             if date_to:
                 parse_day(date_to)
                 q["date"]["$lte"] = date_to
+
             if date_from and date_to and date_from > date_to:
-                raise HTTPException(422, "date_from must be <= date_to")
+                raise HTTPException(
+                    status_code=422,
+                    detail="date_from must be <= date_to",
+                )
+
         if status:
             check_status(status)
             q["status"] = status
-        explain = db.command("explain", {"find": "attendance_logs", "filter": q,
-            "sort": {"date": -1, "emp_code": 1}, "skip": (page - 1) * page_size, "limit": page_size},
-            verbosity="executionStats")
-        collection = "attendance_logs"
+
+        explain = db.command(
+            "explain",
+            {
+                "find": "attendance_logs",
+                "filter": q,
+                "sort": {"date": -1, "emp_code": 1},
+                "skip": (page - 1) * page_size,
+                "limit": page_size,
+            },
+            verbosity="executionStats",
+        )
+
+    # 2. Analytics endpoints
     else:
-        if endpoint in {"employee_monthly"} and (not emp_code or not month):
-            raise HTTPException(422, "emp_code and month are required")
-        if endpoint in {"department_summary", "late_leaderboard"} and not month:
-            raise HTTPException(422, "month is required")
-        #if endpoint == "department_trend" and (not department or not from_date or not to_date):
-            #raise HTTPException(422, "department, from, and to are required")
-        
-        elif endpoint == "department_trend":
-            if not department or not from_date or not to_date:
+        pipeline = []
+
+        if endpoint == "employee_monthly":
+            if not emp_code or not month:
                 raise HTTPException(
                     status_code=422,
-                    detail="department, from, and to are required"
+                    detail="emp_code and month are required",
                 )
 
-            try:
-                start = parse_day(from_date)
-                end = parse_day(to_date)
+            first_s, last_s, _, _ = month_bounds(month)
 
-                if end < start or (end - start).days + 1 > 92:
-                    raise HTTPException(
-                        status_code=422,
-                        detail="Invalid trend range"
-                    )
+            pipeline = [
+                {
+                    "$match": {
+                        "emp_code": emp_code,
+                        "date": {
+                            "$gte": first_s,
+                            "$lte": last_s,
+                        },
+                    }
+                }
+            ]
 
-                pipeline = [
-                    {
-                        "$match": {
-                            "date": {
-                                "$gte": start.isoformat(),
-                                "$lte": end.isoformat()
-                            }
-                        }
-                    },
-                    {
-                        "$match": {
-                            "department": department
+        elif endpoint == "department_summary":
+            if not month:
+                raise HTTPException(
+                    status_code=422,
+                    detail="month is required",
+                )
+
+            first_s, last_s, _, _ = month_bounds(month)
+
+            pipeline = [
+                {
+                    "$match": {
+                        "date": {
+                            "$gte": first_s,
+                            "$lte": last_s,
                         }
                     }
-                ]
+                }
+            ]
 
-            except HTTPException:
-                raise
-            except Exception as exc:
+        elif endpoint == "late_leaderboard":
+            if not month:
                 raise HTTPException(
                     status_code=422,
-                    detail=f"Invalid trend parameters: {str(exc)}"
+                    detail="month is required",
                 )
 
-        pipeline = []
-        if endpoint == "employee_monthly":
             first_s, last_s, _, _ = month_bounds(month)
-            pipeline = [{"$match": {"emp_code": emp_code, "date": {"$gte": first_s, "$lte": last_s}}}]
-        elif endpoint == "department_summary":
-            first_s, last_s, _, _ = month_bounds(month)
-            pipeline = [{"$match": {"date": {"$gte": first_s, "$lte": last_s}}}]
-        elif endpoint == "late_leaderboard":
-            first_s, last_s, _, _ = month_bounds(month)
-            pipeline = [{"$match": {"date": {"$gte": first_s, "$lte": last_s}, "late_minutes": {"$gt": 0}}}]
-        else:
-            start, end = parse_day(from_date), parse_day(to_date)
+
+            pipeline = [
+                {
+                    "$match": {
+                        "date": {
+                            "$gte": first_s,
+                            "$lte": last_s,
+                        },
+                        "late_minutes": {"$gt": 0},
+                    }
+                }
+            ]
+
+        elif endpoint == "department_trend":
+            if not department or not from_value or not to_value:
+                raise HTTPException(
+                    status_code=422,
+                    detail={
+                        "message": "department, from, and to are required",
+                        "received": {
+                            "department": department,
+                            "from": from_value,
+                            "to": to_value,
+                        },
+                    },
+                )
+
+            start = parse_day(from_value)
+            end = parse_day(to_value)
+
             if end < start or (end - start).days + 1 > 92:
-                raise HTTPException(422, "Invalid trend range")
-            pipeline = [{"$match": {"date": {"$gte": start.isoformat(), "$lte": end.isoformat()}}}]
-        explain = db.command("explain", {"aggregate": "attendance_logs", "pipeline": pipeline, "cursor": {}},
-                             verbosity="executionStats")
-        collection = "attendance_logs"
-    return {"endpoint": endpoint, "collection": collection, "explain": explain}
+                raise HTTPException(
+                    status_code=422,
+                    detail="Invalid trend range",
+                )
+
+            pipeline = [
+                {
+                    "$match": {
+                        "date": {
+                            "$gte": start.isoformat(),
+                            "$lte": end.isoformat(),
+                        },
+                        "department": department.strip(),
+                    }
+                }
+            ]
+
+        # Explain the pipeline constructed for this specific endpoint.
+        explain = db.command(
+            "explain",
+            {
+                "aggregate": "attendance_logs",
+                "pipeline": pipeline,
+                "cursor": {},
+            },
+            verbosity="executionStats",
+        )
+
+    return {
+        "endpoint": endpoint,
+        "collection": collection,
+        "explain": json.loads(dumps(explain)),
+    }
